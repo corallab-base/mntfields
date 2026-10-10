@@ -1,0 +1,43 @@
+# Trained models / large artifacts
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ROS 2 / colcon build outputs
+build/
+install/
+log/
+
+# Logs and ROS bags
+*.log
+rosbag2_*/
+*.db3
+*.mcap
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env

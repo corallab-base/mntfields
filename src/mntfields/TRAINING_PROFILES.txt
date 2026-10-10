@@ -1,0 +1,51 @@
+# MNTFields Training Profiles
+
+This file records parameter sets for reproducible training behavior.
+
+[quality_profile]
+train_samples=5000
+train_epoch=50
+max_batches=16
+max_raw=25000
+strict_pair_validity=false
+enable_satellite_training=true
+enable_region_debug_vis=true
+enable_composite_plot=true
+enable_occupancy_snapshot=false
+
+[balanced_visual_fast_profile]
+train_samples=2500
+train_epoch=20
+max_batches=6
+max_raw=10000
+strict_pair_validity=false
+enable_satellite_training=false
+enable_region_debug_vis=true
+enable_composite_plot=true
+enable_occupancy_snapshot=false
+
+[legacy_compat_profile]
+train_samples=2500
+train_epoch=20
+max_batches=6
+max_raw=10000
+strict_pair_validity=false
+enable_satellite_training=false
+enable_region_debug_vis=true
+enable_composite_plot=true
+enable_occupancy_snapshot=false
+
+[strict_pair_profile]
+train_samples=2500
+train_epoch=20
+max_batches=6
+max_raw=10000
+strict_pair_validity=true
+enable_satellite_training=false
+enable_region_debug_vis=true
+enable_composite_plot=true
+enable_occupancy_snapshot=false
+
+[contours]
+# Match original mntfields levels in visualizations
+levels=np.arange(0.0, 3.0, 0.05)

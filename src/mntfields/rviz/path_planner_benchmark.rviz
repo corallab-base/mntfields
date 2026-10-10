@@ -1,0 +1,128 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Name: Grid
+      Plane: XY
+      Plane Cell Count: 60
+      Reference Frame: map
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Map
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+    - Class: rviz_default_plugins/Path
+      Alpha: 1
+      Color: 80; 255; 80
+      Enabled: true
+      Line Style: Billboards
+      Line Width: 0.12
+      Name: NTFields Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /region_graph_path
+    - Class: rviz_default_plugins/Path
+      Alpha: 1
+      Color: 255; 220; 40
+      Enabled: true
+      Line Style: Billboards
+      Line Width: 0.08
+      Name: A* Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /astar_path
+    - Class: rviz_default_plugins/Path
+      Alpha: 1
+      Color: 40; 200; 255
+      Enabled: true
+      Line Style: Billboards
+      Line Width: 0.08
+      Name: RRT* Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rrtstar_path
+    - Class: rviz_default_plugins/Path
+      Alpha: 1
+      Color: 255; 120; 0
+      Enabled: true
+      Line Style: Billboards
+      Line Width: 0.08
+      Name: RRT Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rrt_path
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: RegionGraphMarkers
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /region_graph_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: RegionGraphMarkersDebug
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /region_graph_markers_debug
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      X: 0
+      Y: 0
+      Scale: 80
