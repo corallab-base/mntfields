@@ -1,0 +1,7 @@
+# Simulation image: the desktop image plus Clearpath's Gazebo (Harmonic) simulator.
+# Built on top of mntfields:jazzy-cuda so the CUDA/PyTorch layers are reused.
+FROM mntfields:jazzy-cuda
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-jazzy-clearpath-simulator \
+    && rm -rf /var/lib/apt/lists/*

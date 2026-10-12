@@ -1,0 +1,49 @@
+# Run from the repo root:
+#   docker compose -f docker/compose.yaml build
+#   docker compose -f docker/compose.yaml run --rm mntfields colcon build --symlink-install --packages-select mntfields
+#   docker compose -f docker/compose.yaml run --rm mntfields ros2 launch mntfields antfields_jackal_mapping.launch.py namespace:=<ns>
+services:
+  mntfields:
+    image: mntfields:jazzy-cuda
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        WITH_SIM: ${WITH_SIM:-0}
+    # Host networking + IPC: DDS discovery with the robot and Fast DDS shared
+    # memory behave exactly as if ROS ran natively on the desktop.
+    network_mode: host
+    ipc: host
+    gpus: all
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOME: /home/ubuntu
+      DISPLAY: ${DISPLAY:-:0}
+      QT_X11_NO_MITSHM: "1"
+    volumes:
+      - ..:/ws
+      - ${HOME}/mntfields_models:/home/ubuntu/mntfields_models
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    stdin_open: true
+    tty: true
+
+  # Clearpath Gazebo simulation. Isolated ROS domain + localhost-only discovery, so
+  # the simulated Jackal can never mix with the real robot on the network.
+  #   docker compose -f docker/compose.yaml build sim
+  #   docker compose -f docker/compose.yaml run --rm sim /ws/sim/run_gazebo.sh
+  #   docker compose -f docker/compose.yaml run --rm sim ros2 launch mntfields antfields_jackal_mapping.launch.py namespace:=j100_sim use_sim_time:=true
+  sim:
+    extends:
+      service: mntfields
+    image: mntfields:jazzy-cuda-sim
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.sim
+    environment:
+      ROS_DOMAIN_ID: "43"
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      # OpenGL through the NVIDIA runtime for Gazebo's GUI and GPU lidar.
+      NVIDIA_DRIVER_CAPABILITIES: all

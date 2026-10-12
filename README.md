@@ -97,6 +97,119 @@ mapping node or equivalent launch configuration. Start at low velocity and
 verify the scan frame and `base_link` TF in RViz before enabling autonomous
 motion.
 
+## Jackal single-field mode (offboard desktop, Docker)
+
+Active single-field exploration on a Clearpath Jackal (ROS 2 Jazzy, 2D lidar).
+All computation — SLAM Toolbox, field training, frontier planning, path
+following and RViz — runs on a desktop with an NVIDIA GPU inside Docker. The
+Jackal only runs its stock Clearpath stack; the two talk over ROS 2 topics only.
+Nothing is deployed to the robot.
+
+1. On the robot, read the values the launch needs:
+
+   ```bash
+   cat /etc/clearpath/robot.yaml            # namespace, ros2 domain id / rmw / discovery
+   ros2 topic list | grep -E "scan|cmd_vel"
+   ros2 topic info /<ns>/cmd_vel -v         # TwistStamped -> cmd_vel_stamped:=true
+   ```
+
+2. On the desktop (needs Docker + NVIDIA Container Toolkit), from the repo root:
+
+   ```bash
+   cp docker/.env.example docker/.env       # set ROS_DOMAIN_ID / RMW / discovery to match the robot
+   docker compose -f docker/compose.yaml build
+   docker compose -f docker/compose.yaml run --rm mntfields \
+     colcon build --symlink-install --packages-select mntfields
+   xhost +local:                            # allow RViz to open
+   ```
+
+   Keep the desktop and robot clocks in sync (e.g. chrony); scan timestamps
+   feed TF and SLAM. Check connectivity with
+   `docker compose -f docker/compose.yaml run --rm mntfields ros2 topic hz /<ns>/sensors/lidar2d_0/scan`.
+
+3. Dry run first (velocity goes to a dummy topic, the robot cannot move; the
+   start-up spin is disabled because it could never finish), then live:
+
+   ```bash
+   docker compose -f docker/compose.yaml run --rm mntfields \
+     ros2 launch mntfields antfields_jackal_mapping.launch.py \
+       cmd_vel_topic:=/antfields/cmd_vel_dry initial_spin:=false
+
+   docker compose -f docker/compose.yaml run --rm mntfields \
+     ros2 launch mntfields antfields_jackal_mapping.launch.py max_lin:=0.15
+   ```
+
+   `namespace` defaults to `j100_1639`; pass `namespace:=<ns>` for another
+   robot. The launch remaps `/tf`, `/tf_static` and `/scan` onto the Clearpath
+   namespace and sends velocity to `/<ns>/cmd_vel` (through the Clearpath
+   twist mux, so the joystick still overrides). Robot-size parameters
+   (`wall_min_m`, `wall_max_m`, `collision_pad_cells`, ...) default to
+   Jackal values; see `--show-args`. The trained field is saved under
+   `~/mntfields_models/antfields_jackal/region_1/` on the desktop.
+
+   On this Jackal the Hokuyo faces the **rear** (the power-button side), so
+   `/etc/clearpath/robot.yaml` on the robot must give the lidar `rpy: [0.0,
+   0.0, 3.1415]` (and its real mount position); otherwise every scan is placed
+   180° off. The launch drives rear-first (`drive_reverse:=true`) so the lidar
+   leads; set `drive_reverse:=false` for a forward-facing lidar.
+
+   The Hokuyo UST covers ±135°, so a 90° wedge on the side opposite the lidar
+   is never scanned. The Jackal launch therefore enables, by default: a 360° spin before
+   exploring (`initial_spin`), path validation that only drives through
+   SLAM-mapped free space (`enable_path_validation`, `trim_at_unknown`,
+   `collision_radius_m`, `collision_check_skip_m`), and a live-scan forward
+   safety stop (`safety_stop_enabled`, `robot_front_m`, `robot_half_width_m`,
+   `safety_stop_dist_m`, `safety_slow_dist_m`).
+
+   RViz opens with `rviz/antfields_jackal.rviz`: SLAM map, scan, Jackal model,
+   field path, frontier/goal markers and the learned travel-time field from the
+   robot's current position (`/mntfields/travel_time`, a PointCloud2 whose
+   intensity is travel time; `/mntfields/speed` holds the speed field and is
+   off by default). Tune with `field_vis_radius_m`, `field_vis_resolution_m`
+   and `field_vis_free_only:=false` to show the field outside mapped free space.
+
+### Simulating the Jackal
+
+Both simulators reproduce this Jackal's interfaces (namespaced topics and TF,
+`TwistStamped` cmd_vel, rear-mounted Hokuyo facing backwards) and run on an
+isolated, localhost-only ROS domain, so they can never reach the real robot.
+
+**Gazebo (Clearpath simulator, with GUI and RViz).** `sim/robot.yaml` is a copy
+of the robot's config under the namespace `j100_sim`; `sim/worlds/obstacle_room.sdf`
+is an 8 x 8 m room with a 1.5 x 1.5 m box in the centre.
+
+```bash
+docker compose -f docker/compose.yaml build sim          # once: adds Gazebo Harmonic
+xhost +local:
+# terminal 1: Gazebo + the simulated Jackal (optional args: x y yaw)
+docker compose -f docker/compose.yaml run --rm sim /ws/sim/run_gazebo.sh
+# terminal 2: SLAM + antfields + RViz against the simulated robot
+docker compose -f docker/compose.yaml run --rm sim \
+  ros2 launch mntfields antfields_jackal_mapping.launch.py \
+    namespace:=j100_sim use_sim_time:=true
+```
+
+**The real maze.** `sim/map_to_world.py` turns a SLAM map of the real maze into
+both a Gazebo world and a 2D-simulator map, so its actual passages can be tested:
+
+```bash
+# with a run active (reads /map only); writes sim/worlds/real_maze.sdf and sim/maps/real_maze.npz
+docker compose -f docker/compose.yaml run --rm mntfields python3 /ws/sim/map_to_world.py --grab --name real_maze
+# Gazebo in the real maze (args: x y yaw world)
+docker compose -f docker/compose.yaml run --rm sim /ws/sim/run_gazebo.sh 0.10 1.02 0.63 real_maze
+```
+
+**Headless 2D simulator** (`src/mntfields/scripts/sim_jackal_2d.py`): no GUI,
+starts in seconds and logs collisions of the robot footprint; useful for quick
+debugging. Run it in the same container as the launch, on its own domain:
+
+```bash
+docker compose -f docker/compose.yaml run --rm \
+  -e ROS_DOMAIN_ID=42 -e ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST mntfields bash -c '
+  python3 /ws/src/mntfields/scripts/sim_jackal_2d.py --ns sim &   # add --map /ws/sim/maps/real_maze.npz
+  ros2 launch mntfields antfields_jackal_mapping.launch.py namespace:=sim'
+```
+
 ## Jackal migration notes
 
 This code is not automatically Jackal-ready. The following must be adapted:

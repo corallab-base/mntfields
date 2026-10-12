@@ -172,6 +172,10 @@ class Navigator:
         self._w_prev = 0.0
 
         self.path_complete = False
+        # Drive rear-first (e.g. a rear-facing lidar on a robot that must see where it goes).
+        # The follower then steers the robot's back along the path and negates linear velocity;
+        # angular velocity is unchanged because yaw and yaw + pi rotate together.
+        self.reverse = bool(getattr(node, 'drive_reverse', False))
 
         self._raw_path = None
         self._path_xy = None
@@ -213,6 +217,21 @@ class Navigator:
 
     def publish_path(self, path_np):
         pass  # moved to gridmap_node._publish_nav_path (full untruncated field path)
+
+    def _path_end_tolerance(self) -> float:
+        """How close to the end of the current path counts as done.
+
+        Defaults to goal_reached_dist; path_end_tolerance_m > 0 overrides it, because a
+        committed path piece can be shorter than goal_reached_dist and would otherwise
+        count as finished before the robot moves.
+        """
+        try:
+            tol = float(self.node.get_parameter('path_end_tolerance_m').value)
+        except Exception:
+            tol = -1.0
+        if tol > 0.0:
+            return tol
+        return float(self.node.get_parameter('goal_reached_dist').value)
 
     def _rate_limit(self, w_des: float, dt: float) -> float:
         if dt <= 0.0:
@@ -263,8 +282,10 @@ class Navigator:
 
         robot_xy = np.asarray(robot_src[:2], dtype=np.float32)
         yaw = float(yaw_src)
+        if self.reverse:
+            yaw = wrap_pi(yaw + math.pi)
 
-        goal_reached_dist = float(self.node.get_parameter('goal_reached_dist').value)
+        goal_reached_dist = self._path_end_tolerance()
         dist_to_final = float(np.linalg.norm(path_xy[-1] - robot_xy))
         if dist_to_final < goal_reached_dist:
             self.stop_robot()
@@ -349,10 +370,10 @@ class Navigator:
         w = self._rate_limit(w_des, dt)
 
         cmd = Twist()
-        cmd.linear.x = v
+        cmd.linear.x = -v if self.reverse else v
         cmd.angular.z = w
         self.node.cmd_pub.publish(cmd)
-        self.last_cmd_v = v
+        self.last_cmd_v = cmd.linear.x
         self.last_cmd_w = w
         return False
 

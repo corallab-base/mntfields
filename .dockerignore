@@ -1,0 +1,7 @@
+.git
+models/
+build/
+install/
+log/
+**/__pycache__/
+docker/.env

@@ -12,20 +12,23 @@ segmentation / ownership logic.
 import math
 import os
 import threading
+import time
 
 import numpy as np
 import rclpy
 import rclpy.time
 import tf2_ros
 import torch
+from scipy.ndimage import binary_dilation, distance_transform_edt, label
+from skimage.graph import MCP_Geometric
 from scipy.spatial.transform import Rotation
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import LaserScan
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from visualization_msgs.msg import Marker
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -40,14 +43,58 @@ from mntfields.mntfields_ros.sensing.lidar_adapter import Lidar2DAdapter
 from mntfields.utils.mntfields_utils import straight_line_path
 
 
-MODEL_FOLDER = "/home/mayank/turtlebot3_ws/antfields_model"
+DEFAULT_MODEL_DIR = os.path.expanduser("~/mntfields_models/antfields")
+
+
+class _StampedCmdPublisher:
+    """Publishes Twist commands as TwistStamped (e.g. Clearpath Jazzy cmd_vel)."""
+
+    def __init__(self, node, topic, frame_id):
+        self._node = node
+        self._pub = node.create_publisher(TwistStamped, topic, 10)
+        self._frame_id = frame_id
+
+    def publish(self, twist: Twist):
+        msg = TwistStamped()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = self._frame_id
+        msg.twist = twist
+        self._pub.publish(msg)
+
+
+class _SafetyFilteredPublisher:
+    """Runs every velocity command through filter_fn before publishing it."""
+
+    def __init__(self, inner, filter_fn):
+        self._inner = inner
+        self._filter_fn = filter_fn
+
+    def publish(self, twist: Twist):
+        self._inner.publish(self._filter_fn(twist))
 
 
 class AntfieldsGridmapNode(Node):
     def __init__(self):
         super().__init__("antfields_gridmap")
 
-        os.makedirs(MODEL_FOLDER, exist_ok=True)
+        self.declare_parameter("model_dir", DEFAULT_MODEL_DIR)
+        self.declare_parameter("scan_topic", "/scan")
+        self.declare_parameter("map_topic", "/map")
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("cmd_vel_stamped", False)
+        self.declare_parameter("base_frame", "base_footprint")
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("lidar_max_range_m", 3.5)
+        self.declare_parameter("wall_min_m", 0.05)
+        self.declare_parameter("wall_max_m", 0.80)
+        # Robot clearance for the field: walls are treated as inflated by this much, so
+        # the speed band above (and how strongly walls repel paths) is unchanged.
+        self.declare_parameter("wall_offset_m", 0.0)
+
+        self.model_dir = os.path.expanduser(str(self.get_parameter("model_dir").value))
+        os.makedirs(self.model_dir, exist_ok=True)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.odom_frame = str(self.get_parameter("odom_frame").value)
 
         self.declare_parameter("train_timer_sec", 0.2)
         self.declare_parameter("train_samples", 12000)
@@ -56,6 +103,9 @@ class AntfieldsGridmapNode(Node):
         self.declare_parameter("region_raw_memory_cell_size_m", 0.25)
         self.declare_parameter("enable_region_debug_vis", True)
         self.declare_parameter("goal_reached_dist", 0.30)
+        # Path follower: distance to the end of the current path that counts as done.
+        # <= 0 uses goal_reached_dist.
+        self.declare_parameter("path_end_tolerance_m", -1.0)
         self.declare_parameter("max_lin", 0.12)
         self.declare_parameter("max_ang", 0.90)
         self.declare_parameter("control_timer_sec", 0.10)
@@ -68,6 +118,9 @@ class AntfieldsGridmapNode(Node):
         self.declare_parameter("path_truncate_trigger_m", 0.80)
         self.declare_parameter("frontier_max_goal_dist_m", 6.0)
         self.declare_parameter("goal_blacklist_radius_m", 0.50)
+        # Abandoned (not reached) goals are only blacklisted for this long; they are
+        # often reachable again once the field has trained or more map is known.
+        self.declare_parameter("abandoned_goal_ttl_sec", 60.0)
         self.declare_parameter("train_min_translation_m", 0.05)
         self.declare_parameter("train_min_rotation_rad", 0.12)
         self.declare_parameter("train_force_period_sec", 0.75)
@@ -76,11 +129,56 @@ class AntfieldsGridmapNode(Node):
         self.declare_parameter("fixed_region_size_m", 20.0)
         self.declare_parameter("expand_region_with_map", False)
         self.declare_parameter("collision_pad_cells", 2)
+        # >= 0: SLAM collision = closer than this (Euclidean) to an occupied cell, via a
+        # distance map; 0 = only occupied cells themselves (no inflation).
+        # < 0: the square collision_pad_cells check (original behaviour).
+        self.declare_parameter("collision_radius_m", -1.0)
         self.declare_parameter("path_collision_sample_step_m", 0.03)
         self.declare_parameter("unknown_is_collision", False)
         self.declare_parameter("trim_at_unknown", False)
         self.declare_parameter("enable_path_validation", False)
         self.declare_parameter("allow_straight_line_fallback", False)
+        self.declare_parameter("field_vis_timer_sec", 1.0)
+        self.declare_parameter("field_vis_radius_m", 6.0)
+        self.declare_parameter("field_vis_resolution_m", 0.10)
+        self.declare_parameter("field_vis_free_only", True)
+        # Ignore SLAM collisions this close to the path start, so a robot that
+        # ends up near a wall can still plan away (the scan safety stop covers it).
+        self.declare_parameter("collision_check_skip_m", 0.0)
+        # > 0: only validate this much of each path; only path_commit_max_m is driven
+        # before replanning, and the rest is re-checked then. 0 validates the whole path.
+        self.declare_parameter("validation_horizon_m", 0.0)
+        # Reject paths whose first step points away from the goal. Off for maps with
+        # obstacles: a valid path often has to start by going around one.
+        self.declare_parameter("require_goalward_start", True)
+        # A frontier goal can sit closer to a wall than collision_radius_m allows. If a
+        # path only becomes unsafe within this distance of the goal, drive to its last
+        # safe point instead of rejecting it, and count the goal as reached there.
+        self.declare_parameter("goal_approach_m", 1.0)
+        # > 0: route to far frontiers on the SLAM map (clearance-aware shortest path) and
+        # let the field plan to a point this far along the route, one piece at a time.
+        # The single field's rollout gets trapped in local minima over long routes.
+        # 0 = plan straight to the frontier (original behaviour).
+        self.declare_parameter("route_subgoal_dist_m", 0.0)
+        # > 0: ignore frontier points that only border an unknown patch smaller than
+        # this many cells (holes in mapped free space that no beam happened to hit).
+        self.declare_parameter("min_frontier_unknown_cells", 0)
+        # Live-scan forward safety stop (needed for lidars with a rear blind spot).
+        self.declare_parameter("safety_stop_enabled", False)
+        self.declare_parameter("robot_front_m", 0.30)
+        self.declare_parameter("robot_rear_m", 0.30)
+        # Drive rear-first along paths (for a lidar that faces the robot's rear).
+        self.declare_parameter("drive_reverse", False)
+        self.declare_parameter("robot_half_width_m", 0.25)
+        self.declare_parameter("safety_stop_dist_m", 0.25)
+        self.declare_parameter("safety_slow_dist_m", 0.60)
+        self.declare_parameter("safety_scan_timeout_sec", 0.5)
+        # > 0: before turning on the spot, need this much SLAM-map clearance (the radius
+        # the robot's corners sweep); otherwise creep to where there is room first.
+        self.declare_parameter("robot_turn_radius_m", 0.0)
+        # One full turn in place before exploring, to fill a lidar blind spot.
+        self.declare_parameter("initial_spin", False)
+        self.declare_parameter("initial_spin_speed", 0.4)
 
         self.robot_pos = None
         self.robot_yaw = 0.0
@@ -105,6 +203,7 @@ class AntfieldsGridmapNode(Node):
         self._current_goal = None
         self._active_path_goal = None
         self._visited_goals = []
+        self._abandoned_goals = []  # [(xy, monotonic time abandoned)]
         self._goal_blacklist_radius = float(
             self.get_parameter("goal_blacklist_radius_m").value
         )
@@ -124,36 +223,75 @@ class AntfieldsGridmapNode(Node):
         self._train_lock = threading.Lock()
 
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # Receive TF on the listener's own internal node and thread. Lookups with a
+        # timeout (and planning) block this node's executor; if TF were received on it
+        # too, every lookup would starve and the buffer would fall further behind.
+        # Passing node=None matters: with our node, spin_thread would spin *this* node
+        # on a second executor. Process-wide remaps (/tf -> /<ns>/tf) still apply.
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, None, spin_thread=True)
 
         self.adapter = Lidar2DAdapter(
-            max_range=3.5,
+            max_range=float(self.get_parameter("lidar_max_range_m").value),
             lidar_height=float(self.get_parameter("lidar_height_m").value),
         )
 
-        self.create_subscription(LaserScan, "/scan", self.lidar_cb, 10)
+        # Planning can take seconds. On the executor thread it would also stop scans and
+        # velocity commands (the robot's twist_mux then halts it), so the executor only runs
+        # the fast callbacks (scans, control, training trigger) and everything slow or
+        # map-reading runs on one planning thread (see _planning_loop). The map callback
+        # only hands the newest map over, so the map never changes mid-plan.
+        # Guards the active path and the Navigator between control_tick and planning.
+        self._nav_lock = threading.RLock()
+        self._pending_map = None
+        self._planning_stop = threading.Event()
+
+        # Sensor-data (best-effort) QoS receives from both reliable and best-effort
+        # lidar publishers; a reliable subscription silently gets nothing from the latter.
+        self.create_subscription(
+            LaserScan, str(self.get_parameter("scan_topic").value), self.lidar_cb,
+            qos_profile_sensor_data,
+        )
 
         map_qos = QoSProfile(
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
             reliability=QoSReliabilityPolicy.RELIABLE,
             depth=1,
         )
-        self.create_subscription(OccupancyGrid, "/map", self.slam_map_cb, map_qos)
+        self.create_subscription(
+            OccupancyGrid, str(self.get_parameter("map_topic").value),
+            lambda msg: setattr(self, "_pending_map", msg), map_qos,
+        )
 
         self.nav_frame = "map"
 
-        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        cmd_topic = str(self.get_parameter("cmd_vel_topic").value)
+        if bool(self.get_parameter("cmd_vel_stamped").value):
+            self.cmd_pub = _StampedCmdPublisher(self, cmd_topic, self.base_frame)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
+        if (bool(self.get_parameter("safety_stop_enabled").value)
+                or float(self.get_parameter("robot_turn_radius_m").value) > 0.0):
+            self.cmd_pub = _SafetyFilteredPublisher(self.cmd_pub, self._filter_cmd)
+        self._latest_scan_wall_t = 0.0
+        self._safety_blocked = False
+        self._spin_done = not bool(self.get_parameter("initial_spin").value)
+        self._spin_accum = 0.0
+        self._spin_last_yaw = None
         self.field_path_pub = self.create_publisher(Path, "/field_path", 10)
         self.field_path_pub_alt = self.create_publisher(
             Path, "/mntfields/local_model_path", 10
         )
         self.nav_path_pub = self.create_publisher(Path, "/navigator_path", 10)
+        self.inflation_pub = self.create_publisher(OccupancyGrid, "/mntfields/inflation", map_qos)
         self.frontier_occ_pub = self.create_publisher(
             OccupancyGrid, "/mntfields/frontier", map_qos
         )
         self.frontier_marker_pub = self.create_publisher(Marker, "/mntfields/frontier_markers", 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/mntfields/goal_marker", 10)
+        self.travel_time_pub = self.create_publisher(PointCloud2, "/mntfields/travel_time", 1)
+        self.speed_pub = self.create_publisher(PointCloud2, "/mntfields/speed", 1)
 
+        self.drive_reverse = bool(self.get_parameter("drive_reverse").value)
         self.markers = MarkerPublisher(self)
         self.navigator = Navigator(self)
 
@@ -161,9 +299,11 @@ class AntfieldsGridmapNode(Node):
         ctrl_dt = float(self.get_parameter("control_timer_sec").value)
         vis_dt = float(self.get_parameter("vis_timer_sec").value)
         self.create_timer(train_dt, self.train_tick)
-        self.create_timer(ctrl_dt, self.exploration_tick)
         self.create_timer(ctrl_dt, self.control_tick)
-        self.create_timer(vis_dt, self.vis_tick)
+        self._planning_thread = threading.Thread(
+            target=self._planning_loop, args=(ctrl_dt, vis_dt), daemon=True
+        )
+        self._planning_thread.start()
 
         self.get_logger().info("[AntFieldsNode] initialized")
 
@@ -179,7 +319,10 @@ class AntfieldsGridmapNode(Node):
             model.prev_loss_queue = []
 
     def _lookup_robot_transform(self):
-        for base_frame in ("base_footprint", "base_link"):
+        candidates = [self.base_frame] + [
+            f for f in ("base_footprint", "base_link") if f != self.base_frame
+        ]
+        for base_frame in candidates:
             try:
                 return self.tf_buffer.lookup_transform(
                     "map",
@@ -188,8 +331,35 @@ class AntfieldsGridmapNode(Node):
                     timeout=Duration(seconds=0.05),
                 )
             except Exception:
+                pass
+            # "Latest" through map is pinned to the newest map->odom stamp; if SLAM
+            # stalls, odom->base at that time has already left the buffer. Combine the
+            # latest map->odom with the latest odom->base instead.
+            try:
+                return self.tf_buffer.lookup_transform_full(
+                    "map",
+                    rclpy.time.Time(),
+                    base_frame,
+                    rclpy.time.Time(),
+                    self.odom_frame,
+                    timeout=Duration(seconds=0.05),
+                )
+            except Exception:
                 continue
         return None
+
+    def _warn_if_slam_stale(self):
+        try:
+            t = self.tf_buffer.lookup_transform("map", self.odom_frame, rclpy.time.Time())
+        except Exception:
+            return
+        age = (self.get_clock().now() - rclpy.time.Time.from_msg(t.header.stamp)).nanoseconds * 1e-9
+        if age > 3.0:
+            self.get_logger().warn(
+                f"[SLAM] map->{self.odom_frame} is {age:.1f}s old; slam_toolbox is not "
+                "updating (map frozen, using last known map->odom)",
+                throttle_duration_sec=5.0,
+            )
 
     def _update_robot_pose_from_tf(self):
         t = self._lookup_robot_transform()
@@ -216,7 +386,11 @@ class AntfieldsGridmapNode(Node):
         if world_pts is None:
             return
 
+        # The field is 2D and Region queries its obstacle KD-tree at z=0; keeping the
+        # lidar's TF height here would add it to every wall distance.
+        world_pts[:, 2] = 0.0
         self._latest_world_pts = world_pts
+        self._latest_scan_wall_t = time.monotonic()
         self._latest_robot_pose_for_pts = self.robot_pos.copy()
 
     def _transform_scan_points_to_map(self, pts_sensor: np.ndarray, msg: LaserScan):
@@ -236,10 +410,13 @@ class AntfieldsGridmapNode(Node):
             )
         except Exception:
             try:
-                tf_msg = self.tf_buffer.lookup_transform(
+                # Lidar pose in odom at the scan time, combined with the latest map->odom.
+                tf_msg = self.tf_buffer.lookup_transform_full(
                     "map",
-                    source_frame,
                     rclpy.time.Time(),
+                    source_frame,
+                    stamp,
+                    self.odom_frame,
                     timeout=Duration(seconds=0.05),
                 )
             except Exception as exc:
@@ -254,6 +431,37 @@ class AntfieldsGridmapNode(Node):
         trans = np.array([t.x, t.y, t.z], dtype=np.float32)
         return (pts_sensor @ rot.T) + trans
 
+    def _planning_loop(self, period, vis_dt):
+        """Exploration, map ingestion and visualisation, off the executor thread."""
+        field_dt = float(self.get_parameter("field_vis_timer_sec").value)
+        last_vis = last_field = 0.0
+        while not self._planning_stop.is_set() and rclpy.ok():
+            t0 = time.monotonic()
+            for name, fn in (("map", self._ingest_pending_map), ("exploration", self.exploration_tick)):
+                try:
+                    fn()
+                except Exception as exc:
+                    self.get_logger().error(f"[PLANNING] {name} failed: {exc}")
+            if t0 - last_field >= field_dt:
+                last_field = t0
+                try:
+                    self.field_vis_tick()
+                except Exception as exc:
+                    self.get_logger().warn(f"[PLANNING] field vis failed: {exc}")
+            if t0 - last_vis >= vis_dt:
+                last_vis = t0
+                try:
+                    self._publish_frontier_markers()
+                    self.vis_tick()
+                except Exception as exc:
+                    self.get_logger().warn(f"[PLANNING] vis failed: {exc}")
+            self._planning_stop.wait(max(0.0, period - (time.monotonic() - t0)))
+
+    def _ingest_pending_map(self):
+        msg, self._pending_map = self._pending_map, None
+        if msg is not None:
+            self.slam_map_cb(msg)
+
     def slam_map_cb(self, msg: OccupancyGrid):
         info = msg.info
         self._slam_cell_size = float(info.resolution)
@@ -264,7 +472,10 @@ class AntfieldsGridmapNode(Node):
         h = int(info.height)
         w = int(info.width)
         arr = np.array(msg.data, dtype=np.int8).reshape(h, w)
+        # Distance (m) from every cell to the nearest occupied cell, for collision checks.
+        self._slam_occ_dist = distance_transform_edt(arr <= 50) * self._slam_cell_size
         self._slam_arr = arr
+        self._publish_inflation(msg)
 
         map_size = float(max(h, w) * self._slam_cell_size)
         center_xy = self._slam_origin + np.array(
@@ -290,6 +501,7 @@ class AntfieldsGridmapNode(Node):
             self.gridmap.regions = self._region_store
 
         self.gridmap.ingest_slam_map(msg)
+        self._drop_hole_frontiers(arr)
         self._ensure_global_region()
 
         if not self._slam_map_received:
@@ -334,10 +546,13 @@ class AntfieldsGridmapNode(Node):
 
         if self.region is None:
             self.region = Region(
-                model_folder=MODEL_FOLDER,
+                model_folder=self.model_dir,
                 bound=bound,
                 version=1,
                 device="cuda:0",
+                wall_min=float(self.get_parameter("wall_min_m").value),
+                wall_max=float(self.get_parameter("wall_max_m").value),
+                wall_offset=float(self.get_parameter("wall_offset_m").value),
             )
             self.region.max_raw_samples = int(
                 self.get_parameter("region_max_raw_samples").value
@@ -503,20 +718,140 @@ class AntfieldsGridmapNode(Node):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _filter_cmd(self, twist: Twist) -> Twist:
+        twist = self._apply_turn_guard(twist)
+        if bool(self.get_parameter("safety_stop_enabled").value):
+            twist = self._apply_safety_stop(twist)
+        return twist
+
+    def _apply_turn_guard(self, twist: Twist) -> Twist:
+        """Hold turns on the spot where the robot's corners would hit a mapped wall,
+        creeping forward or back to more clearance first."""
+        turn_r = float(self.get_parameter("robot_turn_radius_m").value)
+        if turn_r <= 0.0 or abs(twist.linear.x) > 0.02 or abs(twist.angular.z) < 1e-3:
+            return twist
+        if self.robot_pos is None:
+            return twist
+        here = self._clearance_at(self.robot_pos[:2])
+        if here is None or here >= turn_r:
+            return twist
+        heading = np.array([math.cos(self.robot_yaw), math.sin(self.robot_yaw)], dtype=np.float32)
+        options = []
+        for direction in (1.0, -1.0):
+            c = self._clearance_at(self.robot_pos[:2] + direction * 0.10 * heading)
+            if c is not None:
+                options.append((c, direction))
+        best = max(options) if options else None
+        twist.angular.z = 0.0
+        if best is not None and best[0] > here + 0.005:
+            twist.linear.x = 0.05 * best[1]
+            self.get_logger().info(
+                f"[TURN] {here:.2f}m from a wall is too tight to turn (needs {turn_r:.2f}m); "
+                f"creeping {'forward' if best[1] > 0 else 'back'} first",
+                throttle_duration_sec=2.0,
+            )
+        else:
+            self.get_logger().warn(
+                f"[TURN] {here:.2f}m from a wall is too tight to turn and no room to creep; holding",
+                throttle_duration_sec=2.0,
+            )
+        return twist
+
+    def _apply_safety_stop(self, twist: Twist) -> Twist:
+        """Limit linear speed using live scan points in a corridor ahead of the footprint
+        in the direction of travel (forward or reverse).
+
+        Rotation is left alone so the robot can still turn away and replan.
+        """
+        if twist.linear.x == 0.0:
+            return twist
+        direction = 1.0 if twist.linear.x > 0.0 else -1.0
+        pts = self._latest_world_pts
+        stale = (time.monotonic() - self._latest_scan_wall_t) > float(
+            self.get_parameter("safety_scan_timeout_sec").value
+        )
+        if pts is None or self.robot_pos is None or stale:
+            twist.linear.x = 0.0
+            self.get_logger().warn(
+                "[SAFETY] no fresh scan; blocking linear motion", throttle_duration_sec=2.0
+            )
+            return twist
+
+        # Scan points (map frame) -> robot frame.
+        c, s = math.cos(self.robot_yaw), math.sin(self.robot_yaw)
+        d = pts[:, :2] - self.robot_pos[:2]
+        x = direction * (c * d[:, 0] + s * d[:, 1])  # distance along the travel direction
+        y = -s * d[:, 0] + c * d[:, 1]
+        front = float(
+            self.get_parameter("robot_front_m" if direction > 0 else "robot_rear_m").value
+        )
+        half_w = float(self.get_parameter("robot_half_width_m").value)
+        in_corridor = (x > 0.0) & (np.abs(y) < half_w)
+        if not in_corridor.any():
+            self._safety_blocked = False
+            return twist
+
+        gap = float(np.min(x[in_corridor])) - front
+        stop = float(self.get_parameter("safety_stop_dist_m").value)
+        slow = max(stop + 1e-3, float(self.get_parameter("safety_slow_dist_m").value))
+        if gap < stop:
+            twist.linear.x = 0.0
+            if not self._safety_blocked:
+                self.get_logger().warn(
+                    f"[SAFETY] obstacle {gap:.2f}m {'ahead' if direction > 0 else 'behind'}; "
+                    "stopping linear motion"
+                )
+            self._safety_blocked = True
+        else:
+            twist.linear.x *= min(1.0, (gap - stop) / (slow - stop))
+            self._safety_blocked = False
+        return twist
+
+    def _initial_spin_tick(self) -> bool:
+        """Turn one full revolution in place. Returns True while still spinning."""
+        if self._spin_done:
+            return False
+        if self.robot_pos is None:
+            return True
+        if self._spin_last_yaw is not None:
+            dyaw = math.atan2(
+                math.sin(self.robot_yaw - self._spin_last_yaw),
+                math.cos(self.robot_yaw - self._spin_last_yaw),
+            )
+            self._spin_accum += abs(dyaw)
+        else:
+            self.get_logger().info("[SPIN] initial 360 deg spin to cover the lidar blind spot")
+        self._spin_last_yaw = self.robot_yaw
+        if self._spin_accum >= 2.0 * math.pi:
+            self._spin_done = True
+            self.navigator.stop_robot()
+            self.get_logger().info("[SPIN] done")
+            return False
+        cmd = Twist()
+        cmd.angular.z = float(self.get_parameter("initial_spin_speed").value)
+        self.cmd_pub.publish(cmd)
+        return True
+
     def control_tick(self):
-        if self.robot_pos is None or self._path is None or self._current_goal is None:
-            self.navigator.stop_robot()
-            return
-        try:
-            if self.navigator.drive_path(self._path):
-                self._controller_path_done = True
-        except Exception as exc:
-            self.get_logger().warn(f"[CONTROL] {exc}")
-            self.navigator.stop_robot()
+        with self._nav_lock:
+            if self._initial_spin_tick():
+                return
+            if self.robot_pos is None or self._path is None or self._current_goal is None:
+                self.navigator.stop_robot()
+                return
+            try:
+                if self.navigator.drive_path(self._path):
+                    self._controller_path_done = True
+            except Exception as exc:
+                self.get_logger().warn(f"[CONTROL] {exc}")
+                self.navigator.stop_robot()
 
     def _point_in_collision_slam(self, xy, pad_cells=None):
         if self._slam_arr is None:
             return False
+        radius = float(self.get_parameter("collision_radius_m").value)
+        if radius >= 0.0:
+            return self._point_in_collision_radius(xy, radius)
         if pad_cells is None:
             pad_cells = int(self.get_parameter("collision_pad_cells").value)
         unknown_is_collision = bool(
@@ -539,6 +874,72 @@ class AntfieldsGridmapNode(Node):
                     return True
         return False
 
+    def _drop_hole_frontiers(self, arr):
+        """Remove frontier points bordering only small enclosed unknown patches."""
+        min_cells = int(self.get_parameter("min_frontier_unknown_cells").value)
+        pts = getattr(self.gridmap, "slam_frontier_points", None)
+        if min_cells <= 0 or pts is None or len(pts) == 0:
+            return
+        unknown = arr < 0
+        labels, n = label(unknown, structure=np.ones((3, 3), bool))
+        if n == 0:
+            return
+        sizes = np.bincount(labels.ravel())
+        big = np.zeros_like(unknown)
+        big_ids = np.flatnonzero(sizes >= min_cells)
+        big_ids = big_ids[big_ids != 0]
+        big[np.isin(labels, big_ids)] = True
+        near_big = binary_dilation(big, structure=np.ones((3, 3), bool), iterations=2)
+        res = float(self._slam_cell_size)
+        h, w = arr.shape
+        c = np.clip(((pts[:, 0] - self._slam_origin[0]) / res).astype(int), 0, w - 1)
+        r = np.clip(((pts[:, 1] - self._slam_origin[1]) / res).astype(int), 0, h - 1)
+        keep = near_big[r, c]
+        if not keep.all():
+            self.gridmap.slam_frontier_points = pts[keep].astype(np.float32, copy=False)
+            self.get_logger().info(
+                f"[FRONTIER] ignored {int((~keep).sum())} frontier points at small unknown holes "
+                f"(< {min_cells} cells) inside the mapped area",
+                throttle_duration_sec=30.0,
+            )
+
+    def _publish_inflation(self, map_msg: OccupancyGrid):
+        """Inflation layer for RViz ("costmap" colour scheme): 100 = wall, 99 = closer than
+        collision_radius_m (paths rejected), 50 = where the field is slowest
+        (wall_offset_m + wall_min_m)."""
+        if self.inflation_pub.get_subscription_count() == 0:
+            return
+        radius = float(self.get_parameter("collision_radius_m").value)
+        if radius < 0.0:
+            pad = int(self.get_parameter("collision_pad_cells").value)
+            radius = pad * self._slam_cell_size
+        clearance = float(self.get_parameter("wall_offset_m").value) + float(
+            self.get_parameter("wall_min_m").value
+        )
+        dist = self._slam_occ_dist
+        grid = np.zeros(dist.shape, dtype=np.int8)
+        grid[dist < clearance] = 50
+        grid[dist < radius] = 99
+        grid[self._slam_arr > 50] = 100
+        out = OccupancyGrid()
+        out.header = map_msg.header
+        out.info = map_msg.info
+        out.data = grid.ravel().tolist()
+        self.inflation_pub.publish(out)
+
+    def _point_in_collision_radius(self, xy, radius):
+        arr, dist = self._slam_arr, self._slam_occ_dist
+        unknown_is_collision = bool(self.get_parameter("unknown_is_collision").value)
+        c = int((float(xy[0]) - float(self._slam_origin[0])) / self._slam_cell_size)
+        r = int((float(xy[1]) - float(self._slam_origin[1])) / self._slam_cell_size)
+        h, w = arr.shape
+        if not (0 <= r < h and 0 <= c < w):
+            return unknown_is_collision
+        if unknown_is_collision and arr[r, c] < 0:
+            return True
+        # Occupied cells have distance 0 and always collide, even with radius 0.
+        return float(dist[r, c]) < max(radius, 0.5 * self._slam_cell_size)
+
     def _segment_in_collision_slam(self, a, b, pad_cells=None):
         if self._slam_arr is None:
             return False
@@ -558,17 +959,57 @@ class AntfieldsGridmapNode(Node):
                 return True
         return False
 
+    def _clearance_at(self, xy):
+        """Distance (m) from xy to the nearest occupied SLAM cell, or None off-map."""
+        dist = getattr(self, "_slam_occ_dist", None)
+        if dist is None:
+            return None
+        c = int((float(xy[0]) - float(self._slam_origin[0])) / self._slam_cell_size)
+        r = int((float(xy[1]) - float(self._slam_origin[1])) / self._slam_cell_size)
+        if not (0 <= r < dist.shape[0] and 0 <= c < dist.shape[1]):
+            return None
+        return float(dist[r, c])
+
     def _path_is_safe_slam(self, pts, pad_cells=None):
+        return self._path_collision_reason(pts, pad_cells=pad_cells)[0] is None
+
+    def _path_collision_reason(self, pts, pad_cells=None):
+        """(None, None) if the path is clear of SLAM obstacles, else (description of the
+        hit, index of the first point that is unsafe or ends an unsafe segment)."""
         arr = np.asarray(pts, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[1] != 2 or len(arr) < 2:
-            return False
+            return "path has fewer than 2 points", 0
+        skip_m = float(self.get_parameter("collision_check_skip_m").value)
+        near_start = np.linalg.norm(arr - arr[0], axis=1) < skip_m
+        along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(arr, axis=0), axis=1))])
+        start_clear = self._clearance_at(arr[0])
         for i in range(len(arr)):
+            if near_start[i]:
+                # Near the start, only moving closer to a wall than the robot already is
+                # counts: the robot may leave a tight spot but not drive further into it.
+                clear = self._clearance_at(arr[i])
+                if (start_clear is not None and clear is not None
+                        and self._point_in_collision_slam(arr[i], pad_cells=pad_cells)
+                        and clear < start_clear - 0.02):
+                    return (
+                        f"point {i}/{len(arr)} at ({arr[i, 0]:.2f},{arr[i, 1]:.2f}), "
+                        f"{along[i]:.2f}m along, moves closer to a wall ({clear:.2f}m) "
+                        f"than the robot is ({start_clear:.2f}m)"
+                    ), i
+                continue
             if self._point_in_collision_slam(arr[i], pad_cells=pad_cells):
-                return False
+                return (
+                    f"point {i}/{len(arr)} at ({arr[i, 0]:.2f},{arr[i, 1]:.2f}), "
+                    f"{along[i]:.2f}m along, too close to an occupied cell"
+                ), i
         for i in range(len(arr) - 1):
+            if near_start[i] or near_start[i + 1]:
+                continue
             if self._segment_in_collision_slam(arr[i], arr[i + 1], pad_cells=pad_cells):
-                return False
-        return True
+                return (
+                    f"segment {i}->{i + 1} ({along[i]:.2f}m along) passes too close to an occupied cell"
+                ), i + 1
+        return None, None
 
     def pick_reachable_frontier(self):
         if self.robot_pos is None or self.gridmap is None:
@@ -577,6 +1018,10 @@ class AntfieldsGridmapNode(Node):
 
         if not self.gridmap.has_raw_slam_frontiers():
             self._frontier_pick_stats = {"source": "gridmap", "raw": 0}
+            self.get_logger().info(
+                "[NAV] no frontiers left in the map: exploration complete",
+                throttle_duration_sec=15.0,
+            )
             return None
 
         robot = self.robot_pos[:2]
@@ -590,8 +1035,9 @@ class AntfieldsGridmapNode(Node):
         stats = {"source": "gridmap", "raw": int(len(cand))}
         d = np.linalg.norm(cand - robot[None, :], axis=1)
 
+        # Farther than goal_reached_dist, or a goal counts as reached the moment it is picked.
         min_standoff = max(
-            0.15, float(self.get_parameter("goal_reached_dist").value) * 0.85
+            0.15, float(self.get_parameter("goal_reached_dist").value) + 0.10
         )
         keep = d >= min_standoff
         cand = cand[keep]
@@ -601,27 +1047,75 @@ class AntfieldsGridmapNode(Node):
             self._frontier_pick_stats = stats
             return None
 
-        max_goal_dist = float(self.get_parameter("frontier_max_goal_dist_m").value)
-        keep = d <= max_goal_dist
+        ttl = float(self.get_parameter("abandoned_goal_ttl_sec").value)
+        now = time.monotonic()
+        self._abandoned_goals = [(g, t) for g, t in self._abandoned_goals if now - t < ttl]
+
+        def not_blacklisted(cand):
+            blocked = list(self._visited_goals) + [g for g, _ in self._abandoned_goals]
+            if not blocked:
+                return np.ones(len(cand), dtype=bool)
+            bl = np.asarray(blocked, dtype=np.float32)
+            min_vd = np.min(np.linalg.norm(cand[:, None, :] - bl[None, :, :], axis=2), axis=1)
+            return min_vd >= self._goal_blacklist_radius
+
+        keep = not_blacklisted(cand)
+        if not keep.any() and self._abandoned_goals:
+            # Every frontier is blacklisted: give abandoned goals another try rather than
+            # stalling. Reached goals stay blacklisted, or the robot loops on them.
+            self.get_logger().info(
+                f"[NAV] all {len(cand)} frontier points blacklisted; retrying "
+                f"{len(self._abandoned_goals)} abandoned goals"
+            )
+            self._abandoned_goals = []
+            keep = not_blacklisted(cand)
+        if not keep.any():
+            self.get_logger().info(
+                f"[NAV] all {len(cand)} remaining frontier points are next to goals already "
+                "reached; nothing left to explore from here",
+                throttle_duration_sec=10.0,
+            )
         cand = cand[keep]
         d = d[keep]
-        stats["after_distcap"] = int(len(cand))
+        stats["after_blacklist"] = int(len(cand))
+        if len(cand) and bool(self.get_parameter("enable_path_validation").value):
+            # A frontier hugging a wall can never pass path validation; skip it up front
+            # instead of failing on it repeatedly.
+            keep = np.array([not self._point_in_collision_slam(p) for p in cand], dtype=bool)
+            cand = cand[keep]
+            d = d[keep]
+            stats["after_clearance"] = int(len(cand))
+        if len(cand) and float(self.get_parameter("route_subgoal_dist_m").value) > 0.0:
+            # Frontiers the robot cannot drive to (e.g. space outside the maze seen through
+            # gaps between wall panels) would be chased forever; keep only reachable ones.
+            reach = self._reachable_from_robot()
+            if reach is not None:
+                keep = np.array([reach(p) for p in cand], dtype=bool)
+                cand = cand[keep]
+                d = d[keep]
+                stats["after_reachable"] = int(len(cand))
         if len(cand) == 0:
             self._frontier_pick_stats = stats
             return None
 
-        if self._visited_goals:
-            visited = np.asarray(self._visited_goals, dtype=np.float32)
-            min_vd = np.min(
-                np.linalg.norm(cand[:, None, :] - visited[None, :, :], axis=2), axis=1
+        # Distance cap last, so blacklisted or wall-hugging frontiers nearby cannot hide
+        # reachable ones farther away.
+        max_goal_dist = float(self.get_parameter("frontier_max_goal_dist_m").value)
+        keep = d <= max_goal_dist
+        if not keep.any():
+            # Nothing within the cap: head for the nearest frontiers instead of stopping.
+            # Paths are driven in short committed pieces, so a far goal is still safe.
+            keep = d <= float(d.min()) + 1.0
+            self.get_logger().info(
+                f"[NAV] no frontier within frontier_max_goal_dist_m={max_goal_dist:.1f}m; "
+                f"using the nearest ones ({float(d.min()):.1f}m)",
+                throttle_duration_sec=10.0,
             )
-            keep = min_vd >= self._goal_blacklist_radius
-            cand = cand[keep]
-            d = d[keep]
-        stats["after_blacklist"] = int(len(cand))
+        cand = cand[keep]
+        d = d[keep]
+        stats["after_distcap"] = int(len(cand))
         self._frontier_pick_stats = stats
-        if len(cand) == 0:
-            return None
+
 
         try:
             from sklearn.cluster import DBSCAN
@@ -745,7 +1239,7 @@ class AntfieldsGridmapNode(Node):
         sm[-1] = pts[-1]
         return sm
 
-    def _sanitize_path(self, robot_xy, goal_xy, pts):
+    def _sanitize_path(self, robot_xy, goal_xy, pts, append_goal=True):
         arr = np.asarray(pts, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[1] != 2 or len(arr) < 2:
             return None
@@ -760,7 +1254,13 @@ class AntfieldsGridmapNode(Node):
         else:
             arr[0] = robot_xy.astype(np.float32)
 
-        if float(np.linalg.norm(arr[-1] - goal_xy)) > 0.10:
+        gap_to_goal = float(np.linalg.norm(arr[-1] - goal_xy))
+        if not append_goal or gap_to_goal > 0.30:
+            # A path that stops short of the goal (cut at unmapped space, or a field
+            # rollout that never reached it) stays short: a straight leg to the goal
+            # would cross whatever made it stop.
+            pass
+        elif gap_to_goal > 0.10:
             arr = np.vstack([arr, goal_xy.astype(np.float32)])
         else:
             arr[-1] = goal_xy.astype(np.float32)
@@ -781,7 +1281,8 @@ class AntfieldsGridmapNode(Node):
 
         if first_step is None:
             return None
-        if float(np.dot(first_step, goal_dir)) < 0.0:
+        if (bool(self.get_parameter("require_goalward_start").value)
+                and float(np.dot(first_step, goal_dir)) < 0.0):
             return None
         return arr
 
@@ -860,6 +1361,7 @@ class AntfieldsGridmapNode(Node):
         frontier_goal=None,
     ):
         if raw is None or len(raw) <= 1:
+            self.get_logger().info(f"[PATH] rejecting {label} path: field produced no path")
             return False
         enable_path_validation = bool(
             self.get_parameter("enable_path_validation").value
@@ -868,20 +1370,69 @@ class AntfieldsGridmapNode(Node):
         decim = self.decimate_path(raw_arr, spacing=0.10)
         smooth = self.smooth_path(decim, window=3)
         if smooth is None or len(smooth) < 2:
+            self.get_logger().info(f"[PATH] rejecting {label} path: too short after smoothing")
             return False
+        trimmed = False
         if enable_path_validation:
+            before = len(smooth)
             smooth = self._trim_at_unvisited(smooth)
-        if smooth is not None and len(smooth) >= 2:
-            smooth = self._sanitize_path(robot_xy, path_goal, smooth)
+            if smooth is None or len(smooth) < 2:
+                self.get_logger().info(
+                    f"[PATH] rejecting {label} path: cut to <2 points at the first cell "
+                    f"SLAM has not mapped as free (trim_at_unknown, {before} points before)"
+                )
+                return False
+            trimmed = len(smooth) < before
+        # A path cut at unmapped space must end at the cut: appending the goal would
+        # add a straight leg through exactly the space the cut excluded.
+        smooth = self._sanitize_path(robot_xy, path_goal, smooth, append_goal=not trimmed)
         if smooth is None or len(smooth) < 2:
+            self.get_logger().info(f"[PATH] rejecting {label} path: dropped by sanitize")
             return False
 
         full_path = np.asarray(smooth, dtype=np.float32)
-        if enable_path_validation and not self._path_is_safe_slam(full_path):
-            self.get_logger().info(
-                f"[PATH] rejecting {label} path after collision validation"
-            )
-            return False
+        check_path = full_path
+        horizon = float(self.get_parameter("validation_horizon_m").value)
+        if horizon > 0.0:
+            check_path = self._truncate_path_by_arclen(full_path, horizon)
+        reason, bad_i = (
+            self._path_collision_reason(check_path) if enable_path_validation else (None, None)
+        )
+        goal_approach = False
+        if reason is not None:
+            approach_m = float(self.get_parameter("goal_approach_m").value)
+            bad_xy = check_path[min(bad_i, len(check_path) - 1)]
+            near_goal = float(np.linalg.norm(bad_xy - np.asarray(path_goal[:2], dtype=np.float32)))
+            to_frontier = frontier_goal is None or float(np.linalg.norm(
+                np.asarray(path_goal[:2], dtype=np.float32) - np.asarray(frontier_goal[:2], dtype=np.float32)
+            )) < 1e-3
+            if (label == "field" and to_frontier and approach_m > 0.0 and bad_i
+                    and near_goal <= approach_m):
+                # Only the approach to the goal is too close to a wall: stop short of it.
+                safe = full_path[:bad_i]
+                safe_len = (
+                    float(np.sum(np.linalg.norm(np.diff(safe, axis=0), axis=1)))
+                    if len(safe) >= 2 else 0.0
+                )
+                if safe_len < 0.15:
+                    self.get_logger().info(
+                        f"[NAV] frontier ({path_goal[0]:.2f},{path_goal[1]:.2f}) reached as close "
+                        "as collision_radius_m allows"
+                    )
+                    self._stop_and_clear_goal(reached=True)
+                    return True
+                short_m = float(np.linalg.norm(safe[-1] - np.asarray(path_goal[:2], dtype=np.float32)))
+                self.get_logger().info(
+                    f"[PATH] {label} path ends too close to a wall ({reason}); "
+                    f"stopping {short_m:.2f}m short of the goal at the last safe point"
+                )
+                full_path = safe
+                goal_approach = True
+            else:
+                self.get_logger().info(
+                    f"[PATH] rejecting {label} path after collision validation: {reason}"
+                )
+                return False
         self._publish_nav_path(full_path)
         full_len = float(np.sum(np.linalg.norm(np.diff(full_path, axis=0), axis=1)))
         commit_trigger = float(self.get_parameter("path_truncate_trigger_m").value)
@@ -896,11 +1447,23 @@ class AntfieldsGridmapNode(Node):
                 f"[PATH] rejecting {label} exec path after truncation collision validation"
             )
             return False
+        exec_reach = float(np.linalg.norm(np.asarray(exec_path[-1]) - np.asarray(robot_xy[:2])))
+        if exec_reach < 0.20 and float(np.linalg.norm(np.asarray(path_goal[:2]) - robot_xy[:2])) > 0.50:
+            # The committed piece folds back to the robot (field rollout dithering in a
+            # local minimum); following it would end at once and replan the same thing.
+            self.get_logger().info(
+                f"[PATH] rejecting {label} path: committed piece ends {exec_reach:.2f}m from the "
+                "robot (no progress)"
+            )
+            return False
 
-        self._path = exec_path
-        self._active_path_goal = np.asarray(path_goal[:2], dtype=np.float32).copy()
-        self.navigator.reset_path()
-        self._controller_path_done = False
+        # Reaching the end of a stopped-short path means the goal is as reached as it gets.
+        self._path_is_goal_approach = goal_approach and not truncated
+        with self._nav_lock:
+            self._path = exec_path
+            self._active_path_goal = np.asarray(path_goal[:2], dtype=np.float32).copy()
+            self.navigator.reset_path()
+            self._controller_path_done = False
         self._path_total_dist = float(
             np.sum(np.linalg.norm(np.diff(self._path, axis=0), axis=1))
         )
@@ -922,17 +1485,19 @@ class AntfieldsGridmapNode(Node):
         return True
 
     def _clear_active_path(self):
-        self._path = None
-        self._active_path_goal = None
-        self.navigator.reset_path()
-        self._controller_path_done = False
+        with self._nav_lock:
+            self._path = None
+            self._active_path_goal = None
+            self.navigator.reset_path()
+            self._controller_path_done = False
 
     def _stop_and_clear_goal(self, reached=True):
         if reached and self._current_goal is not None:
             self._visited_goals.append(self._current_goal[:2].copy())
-        self.navigator.stop_robot()
-        self._clear_active_path()
-        self._current_goal = None
+        with self._nav_lock:
+            self.navigator.stop_robot()
+            self._clear_active_path()
+            self._current_goal = None
         self.goal_xy = None
         self._path_total_dist = None
         self._midpoint_replanned = False
@@ -943,6 +1508,8 @@ class AntfieldsGridmapNode(Node):
         log_now = self._exploration_tick_count % 10 == 0
 
         self._update_robot_pose_from_tf()
+        if log_now:
+            self._warn_if_slam_stale()
         if self.robot_pos is None:
             if log_now:
                 self.get_logger().info("[NAV] waiting for robot pose")
@@ -950,6 +1517,9 @@ class AntfieldsGridmapNode(Node):
         if self.region is None:
             if log_now:
                 self.get_logger().info("[NAV] waiting for first SLAM map")
+            return
+        if not self._spin_done:
+            # control_tick owns the velocity output during the initial spin.
             return
 
         robot_xy = self.robot_pos[:2]
@@ -1015,7 +1585,8 @@ class AntfieldsGridmapNode(Node):
 
             if self._controller_path_done:
                 self._controller_path_done = False
-                if d_frontier < 0.35:
+                if d_frontier < 0.35 or getattr(self, "_path_is_goal_approach", False):
+                    self._path_is_goal_approach = False
                     self._stop_and_clear_goal(reached=True)
                     return
                 self.get_logger().warn(
@@ -1039,7 +1610,7 @@ class AntfieldsGridmapNode(Node):
                     self.get_logger().warn(
                         f"[NAV] abandoning unreachable frontier ({self._current_goal[0]:.2f},{self._current_goal[1]:.2f})"
                     )
-                    self._visited_goals.append(self._current_goal[:2].copy())
+                    self._abandon_goal(self._current_goal)
                     self._current_goal = None
                     self.goal_xy = None
                     self._stuck_replan_count = 0
@@ -1111,20 +1682,21 @@ class AntfieldsGridmapNode(Node):
             forward_only = not (
                 b[0, 0] <= goal[0] <= b[1, 0] and b[0, 1] <= goal[1] <= b[1, 1]
             )
+            plan_goal = self._route_subgoal(robot_xy, goal)
             raw = self.region.generate_field_path(
                 robot_xy,
-                goal,
+                plan_goal,
                 step_size=0.10,
                 max_steps=220,
                 forward_only=forward_only,
             )
             if self._accept_raw_path(
-                robot_xy, goal, raw, forward_only, label="field", frontier_goal=goal
+                robot_xy, plan_goal, raw, forward_only, label="field", frontier_goal=goal
             ):
                 return
 
             safe_wp = self.region.find_safe_waypoint(
-                robot_xy, goal, collision_fn=self._point_in_collision_slam
+                robot_xy, plan_goal, collision_fn=self._point_in_collision_slam
             )
             if safe_wp is not None:
                 raw = self.region.generate_field_path(
@@ -1148,6 +1720,7 @@ class AntfieldsGridmapNode(Node):
                 "[PATH] no field-derived local path accepted; holding position for more training"
             )
             self.navigator.stop_robot()
+            self._count_path_failure(goal)
             return
 
         if allow_straight_line_fallback:
@@ -1178,14 +1751,116 @@ class AntfieldsGridmapNode(Node):
                 )
                 return
 
+        self._count_path_failure(goal)
+
+    def _reachable_from_robot(self, approach_m=0.6):
+        """Function xy -> True if a clearance-respecting route over mapped-free cells
+        gets within approach_m of xy (close enough to map it), or None without a map."""
+        arr, dist = self._slam_arr, getattr(self, "_slam_occ_dist", None)
+        if arr is None or dist is None or arr.shape != dist.shape or self.robot_pos is None:
+            return None
+        res = float(self._slam_cell_size)
+        ox, oy = float(self._slam_origin[0]), float(self._slam_origin[1])
+        h, w = arr.shape
+        radius = float(self.get_parameter("collision_radius_m").value)
+        if radius < 0.0:
+            radius = int(self.get_parameter("collision_pad_cells").value) * res
+        sr = int(np.clip((self.robot_pos[1] - oy) / res, 0, h - 1))
+        sc = int(np.clip((self.robot_pos[0] - ox) / res, 0, w - 1))
+        yy, xx = np.mgrid[0:h, 0:w]
+        near_start = np.hypot(yy - sr, xx - sc) * res < max(
+            0.35, float(self.get_parameter("collision_check_skip_m").value))
+        ok = ((dist >= radius) | near_start) & (arr >= 0) & (arr <= 50)
+        try:
+            costs, _ = MCP_Geometric(np.where(ok, 1.0, np.inf)).find_costs([(sr, sc)])
+        except Exception as exc:
+            self.get_logger().warn(f"[ROUTE] reachability failed: {exc}", throttle_duration_sec=10.0)
+            return None
+        reach_dist = distance_transform_edt(~np.isfinite(costs)) * res
+
+        def reachable(xy):
+            r = int((xy[1] - oy) / res)
+            c = int((xy[0] - ox) / res)
+            return 0 <= r < h and 0 <= c < w and reach_dist[r, c] <= approach_m
+
+        return reachable
+
+    def _route_subgoal(self, robot_xy, goal):
+        """Point route_subgoal_dist_m along the SLAM-map route to goal, or goal itself.
+
+        The route is a minimum-cost path over cells at least collision_radius_m from
+        walls (except right around the robot, which may start close to one), preferring
+        the middle of corridors. Mapped-free cells first; if that fails, unknown cells
+        too, but only near the goal (a frontier borders unknown space): elsewhere unknown
+        cells are often the inside of obstacles whose outline has gaps.
+        """
+        hop = float(self.get_parameter("route_subgoal_dist_m").value)
+        arr, dist = self._slam_arr, getattr(self, "_slam_occ_dist", None)
+        if hop <= 0.0 or arr is None or dist is None or arr.shape != dist.shape:
+            return goal
+        res = float(self._slam_cell_size)
+        ox, oy = float(self._slam_origin[0]), float(self._slam_origin[1])
+        h, w = arr.shape
+
+        def cell(xy):
+            return (int(np.clip((xy[1] - oy) / res, 0, h - 1)),
+                    int(np.clip((xy[0] - ox) / res, 0, w - 1)))
+
+        radius = float(self.get_parameter("collision_radius_m").value)
+        if radius < 0.0:
+            radius = int(self.get_parameter("collision_pad_cells").value) * res
+        start, end = cell(robot_xy), cell(goal)
+        yy, xx = np.mgrid[0:h, 0:w]
+        near_start = np.hypot(yy - start[0], xx - start[1]) * res < max(
+            0.35, float(self.get_parameter("collision_check_skip_m").value))
+        # Cheaper in the middle of corridors than along the clearance limit.
+        base = 1.0 + 2.0 * np.clip((radius + 0.30 - dist) / 0.30, 0.0, 1.0)
+        clear = (dist >= radius) | near_start
+        near_goal = np.hypot(yy - end[0], xx - end[1]) * res < 1.0
+        for allow_unknown in (False, True):
+            ok = clear & (arr <= 50) & ((arr >= 0) | (allow_unknown & near_goal))
+            ok[end] = True
+            cost = np.where(ok, base * np.where(arr < 0, 3.0, 1.0), np.inf)
+            try:
+                mcp = MCP_Geometric(cost)
+                costs, _ = mcp.find_costs([start], [end])
+                if not np.isfinite(costs[end]):
+                    continue
+                route = np.array(mcp.traceback(end), dtype=np.float32)
+            except Exception as exc:
+                self.get_logger().warn(f"[ROUTE] failed: {exc}", throttle_duration_sec=10.0)
+                return goal
+            pts = np.stack([ox + (route[:, 1] + 0.5) * res, oy + (route[:, 0] + 0.5) * res], axis=1)
+            along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+            if along[-1] <= hop + 0.30:
+                return goal
+            sub = pts[int(np.searchsorted(along, hop))]
+            self.get_logger().info(
+                f"[ROUTE] frontier ({goal[0]:.2f},{goal[1]:.2f}) is {along[-1]:.1f}m away by map route"
+                f"{' (via unknown cells near it)' if allow_unknown else ''}; field plans to "
+                f"({sub[0]:.2f},{sub[1]:.2f}) first",
+                throttle_duration_sec=2.0,
+            )
+            return sub.astype(np.float32)
+        self.get_logger().info(
+            f"[ROUTE] no map route to frontier ({goal[0]:.2f},{goal[1]:.2f}); planning straight to it",
+            throttle_duration_sec=5.0,
+        )
+        return goal
+
+    def _count_path_failure(self, goal):
         self._pathgen_fail_count += 1
         if self._pathgen_fail_count >= 5:
             self.get_logger().warn(
                 f"[NAV] abandoning frontier ({goal[0]:.2f},{goal[1]:.2f}) after repeated path failures"
             )
-            self._visited_goals.append(goal[:2].copy())
+            self._abandon_goal(goal)
             self._current_goal = None
             self.goal_xy = None
+            self._pathgen_fail_count = 0
+
+    def _abandon_goal(self, goal):
+        self._abandoned_goals.append((np.asarray(goal[:2], dtype=np.float32).copy(), time.monotonic()))
 
     def vis_tick(self):
         if self.region is not None and self.region.enable_debug_vis:
@@ -1195,7 +1870,71 @@ class AntfieldsGridmapNode(Node):
                     self.region.save_debug_plot(src, view_radius=3.5, robot_xy=src[:2])
                 except Exception as exc:
                     self.get_logger().warn(f"[VIS] debug plot failed: {exc}")
-        self._publish_frontier_markers()
+
+    def _slam_free_mask(self, X_w, Y_w):
+        """True where the SLAM map marks the cell as free (unknown/occupied -> False)."""
+        if self._slam_arr is None:
+            return np.zeros(X_w.shape, dtype=bool)
+        h, w = self._slam_arr.shape
+        ix = np.floor((X_w - self._slam_origin[0]) / self._slam_cell_size).astype(np.int64)
+        iy = np.floor((Y_w - self._slam_origin[1]) / self._slam_cell_size).astype(np.int64)
+        inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+        vals = np.full(X_w.shape, -1, dtype=np.int16)
+        vals[inside] = self._slam_arr[iy[inside], ix[inside]]
+        return (vals >= 0) & (vals < 50)
+
+    def _make_field_cloud(self, xs, ys, values, stamp):
+        """Flat PointCloud2 (x, y, z, intensity) in the map frame."""
+        pts = np.zeros(len(xs), dtype=[
+            ("x", np.float32), ("y", np.float32), ("z", np.float32), ("intensity", np.float32)
+        ])
+        pts["x"] = xs
+        pts["y"] = ys
+        pts["z"] = 0.01
+        pts["intensity"] = values
+        msg = PointCloud2()
+        msg.header.frame_id = "map"
+        msg.header.stamp = stamp
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = [
+            PointField(name=name, offset=4 * i, datatype=PointField.FLOAT32, count=1)
+            for i, name in enumerate(("x", "y", "z", "intensity"))
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 16
+        msg.row_step = 16 * len(pts)
+        msg.is_dense = True
+        msg.data = pts.tobytes()
+        return msg
+
+    def field_vis_tick(self):
+        """Publish the travel-time field from the robot (and the speed field) for RViz."""
+        if self.region is None or self.robot_pos is None:
+            return
+        if self.travel_time_pub.get_subscription_count() == 0 and \
+                self.speed_pub.get_subscription_count() == 0:
+            return
+        radius = float(self.get_parameter("field_vis_radius_m").value)
+        res = float(self.get_parameter("field_vis_resolution_m").value)
+        n = int(2.0 * radius / max(res, 0.02)) + 1
+        try:
+            grid = self.region.evaluate_field_grid(self.robot_pos, view_radius=radius, n=n)
+        except Exception as exc:
+            self.get_logger().warn(f"[FIELD VIS] inference failed: {exc}", throttle_duration_sec=10.0)
+            return
+        if grid is None:
+            return
+        X_w, Y_w, TT, V, inb = grid
+        keep = inb
+        if bool(self.get_parameter("field_vis_free_only").value):
+            keep = keep & self._slam_free_mask(X_w, Y_w)
+        stamp = self.get_clock().now().to_msg()
+        # Speed is infinite at the source cell itself, so filter each field separately.
+        for pub, values in ((self.travel_time_pub, TT), (self.speed_pub, V)):
+            m = keep & np.isfinite(values)
+            if m.any():
+                pub.publish(self._make_field_cloud(X_w[m], Y_w[m], values[m], stamp))
 
 
 def main(args=None):
@@ -1206,8 +1945,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            node.cmd_pub.publish(Twist())
+        except Exception:
+            pass
+        node._planning_stop.set()
+        node._planning_thread.join(timeout=5.0)
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

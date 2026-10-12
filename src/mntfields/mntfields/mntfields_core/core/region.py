@@ -53,6 +53,9 @@ class Region:
         bound: torch.Tensor,
         version: int = -1,
         device: str = "cuda:0",
+        wall_min: float = 0.05,
+        wall_max: float = 0.80,
+        wall_offset: float = 0.0,
     ):
         """
         Args:
@@ -60,6 +63,11 @@ class Region:
             bound:        torch.Tensor [2, 3] – [[xmin,ymin,-0.1],[xmax,ymax,0.1]]
             version:      int region ID; auto-increments when -1
             device:       torch device string
+            wall_min:     near-wall band lower edge [m]; speed is lowest (wall_min/wall_max) here
+            wall_max:     near-wall band upper edge [m]; speed reaches 1 here
+            wall_offset:  robot clearance [m]: distances are measured from walls inflated
+                          by this much (configuration space), so the speed profile and
+                          the wall contrast stay the same for a bigger robot
         """
         # Version
         if version == -1:
@@ -81,8 +89,9 @@ class Region:
         self.bound = bound
 
         # Near-wall band parameters
-        self.minimum = 0.05
-        self.maximum = 0.80 #0.80
+        self.minimum = float(wall_min)
+        self.maximum = float(wall_max)
+        self.wall_offset = float(wall_offset)
 
         # Internal Model instance
         self.model = Model(
@@ -531,7 +540,8 @@ class Region:
         dist0 = dist0_t[:, 0].cpu().numpy()
         idx0 = idx0_t[:, 0].cpu().numpy()
 
-        near_wall_mask = (dist0 > float(self.minimum)) & (dist0 < float(self.maximum))
+        dist0_eff = dist0 - float(self.wall_offset)
+        near_wall_mask = (dist0_eff > float(self.minimum)) & (dist0_eff < float(self.maximum))
         if near_wall_mask.sum() == 0:
             print("[LIDAR KD] no x0 in near-wall band after uniform sampling")
             return None
@@ -621,8 +631,12 @@ class Region:
         n0 = x0 - p0
         n1 = x1 - p1
 
-        y0 = torch.norm(n0, dim=1, keepdim=True)
-        y1 = torch.norm(n1, dim=1, keepdim=True)
+        d0 = torch.norm(n0, dim=1, keepdim=True)
+        d1 = torch.norm(n1, dim=1, keepdim=True)
+        # Distances to walls inflated by the robot clearance.
+        offset = float(getattr(self, "wall_offset", 0.0))
+        y0 = d0 - offset
+        y1 = d1 - offset
 
         maximum = float(self.maximum)
         minimum = float(self.minimum)
@@ -631,12 +645,13 @@ class Region:
         x0 = x0[valid]; x1 = x1[valid]
         y0 = y0[valid]; y1 = y1[valid]
         n0 = n0[valid]; n1 = n1[valid]
+        d0 = d0[valid]; d1 = d1[valid]
 
         if len(x0) == 0:
             return torch.zeros((0, 14), dtype=torch.float32, device=data.device)
 
-        n0 = n0 / (y0 + 1e-8)
-        n1 = n1 / (y1 + 1e-8)
+        n0 = n0 / (d0 + 1e-8)
+        n1 = n1 / (d1 + 1e-8)
 
         x0_n = self.normalize_tensor(x0)
         x1_n = self.normalize_tensor(x1)
@@ -1048,6 +1063,40 @@ class Region:
         Y_n = (Y_w - ymin_b) / sy - 0.5
         inb = np.ones_like(X_w, dtype=bool)
         return X_w, Y_w, X_n, Y_n, inb
+
+    def evaluate_field_grid(self, src_world, view_radius=6.0, n=121):
+        """Travel time from src_world and speed on an n x n grid around it.
+
+        Returns (X_w, Y_w, TT, V, inb) as n x n arrays, or None when the
+        model is not ready or the view does not overlap the region bound.
+        """
+        if self.model.function is None:
+            return None
+        src_world = np.asarray(src_world, dtype=np.float32)
+        src_z = float(src_world[2]) if len(src_world) > 2 else 0.0
+        src_norm = self.normalize(
+            np.array([[src_world[0], src_world[1], src_z]], dtype=np.float32))[0]
+
+        X_w, Y_w, X_n, Y_n, inb = self._view_grid_world(
+            src_world[:2], view_radius=view_radius, n=n)
+        if not inb.any():
+            return None
+
+        XP = np.zeros((X_w.size, 2 * self.model.dim), dtype=np.float32)
+        XP[:, :self.model.dim] = src_norm
+        XP[:, self.model.dim:] = src_norm
+        XP[:, 0] = X_n.reshape(-1)
+        XP[:, 1] = Y_n.reshape(-1)
+
+        XP_t = torch.tensor(XP, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            TT = (self.model.function.TravelTimes(XP_t)
+                  .detach().cpu().numpy().reshape(X_w.shape))
+        XP_t2 = XP_t.clone().requires_grad_(True)
+        with torch.enable_grad():
+            V = (self.model.function.Speed(XP_t2)
+                 .detach().cpu().numpy().reshape(X_w.shape))
+        return X_w, Y_w, TT, V, inb
 
     def _denorm_points(self, pts_norm):
         b = self.bound.detach().cpu().numpy()

@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/antfields_sim_mapping.launch.py',
             'launch/antfields_tb4_mapping.launch.py',
+            'launch/antfields_jackal_mapping.launch.py',
             'launch/mntfields_mapping.launch.py',
             'launch/mntfields_tb4_sim_mapping.launch.py',
             'launch/mntfields_tb4_sim_navigation.launch.py',
@@ -34,6 +35,7 @@ setup(
         ('share/' + package_name + '/config', [
             'config/slam_toolbox_params.yaml',
             'config/slam_toolbox_tb4_params.yaml',
+            'config/slam_toolbox_jackal_params.yaml',
             'config/slam_toolbox_tb4_localization_params.yaml',
             'config/tb4_sim_control.yaml',
         ]),
@@ -46,6 +48,7 @@ setup(
             'rviz/offline.rviz',
             'rviz/path_planner_benchmark.rviz',
             'rviz/tb4_astar_sdf_navigation.rviz',
+            'rviz/antfields_jackal.rviz',
         ]),
     ],
     install_requires=['setuptools'],
