@@ -52,7 +52,18 @@ class MarkerPublisher:
     def publish_goal_marker(self):
         goal_xy = self._goal_xy()
         if goal_xy is None:
+            # No goal any more: remove the marker so RViz does not show a stale goal.
+            if getattr(self, '_goal_marker_shown', False):
+                marker = Marker()
+                marker.header.frame_id = 'map'
+                marker.header.stamp = self.node.get_clock().now().to_msg()
+                marker.ns = 'goal'
+                marker.id = 0
+                marker.action = Marker.DELETE
+                self.node.goal_marker_pub.publish(marker)
+                self._goal_marker_shown = False
             return
+        self._goal_marker_shown = True
 
         marker = Marker()
         marker.header.frame_id = 'map'

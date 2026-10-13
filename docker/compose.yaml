@@ -26,6 +26,8 @@ services:
     volumes:
       - ..:/ws
       - ${HOME}/mntfields_models:/home/ubuntu/mntfields_models
+      # ROS logs of every run (one folder per launch), kept after the container exits.
+      - ${HOME}/mntfields_logs:/home/ubuntu/.ros/log
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     stdin_open: true
     tty: true

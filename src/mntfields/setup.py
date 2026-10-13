@@ -36,6 +36,7 @@ setup(
             'config/slam_toolbox_params.yaml',
             'config/slam_toolbox_tb4_params.yaml',
             'config/slam_toolbox_jackal_params.yaml',
+            'config/nav2_jackal_controller.yaml',
             'config/slam_toolbox_tb4_localization_params.yaml',
             'config/tb4_sim_control.yaml',
         ]),

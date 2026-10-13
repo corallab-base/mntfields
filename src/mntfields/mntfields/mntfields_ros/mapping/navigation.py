@@ -301,7 +301,10 @@ class Navigator:
         proj_s = float(path_s[seg_i] + seg_t * (path_s[seg_i + 1] - path_s[seg_i]))
         self.last_proj_s = max(self.last_proj_s, proj_s)
         self.last_cross_track = float(math.sqrt(max(0.0, dist2))) * float(sign)
-        near_goal = dist_to_final < 0.45
+        # Slow down for, and turn at, the end of the path only if it ends at the goal;
+        # an intermediate piece is followed through (the planner extends it on the way).
+        path_ends_at_goal = bool(getattr(self.node, '_path_end_is_goal', True))
+        near_goal = path_ends_at_goal and dist_to_final < 0.45
         if near_goal:
             L = float(np.clip(dist_to_final * 0.6, 0.06, 0.20))
             target = path_xy[-1].copy()
@@ -354,7 +357,7 @@ class Navigator:
             return False
 
         v = self.v_max * max(0.10, math.cos(heading_err) ** 2)
-        if dist_to_final < 0.5:
+        if path_ends_at_goal and dist_to_final < 0.5:
             v *= dist_to_final / 0.5
         if near_goal:
             v = min(v, 0.12)

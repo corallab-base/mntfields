@@ -161,6 +161,24 @@ Nothing is deployed to the robot.
    safety stop (`safety_stop_enabled`, `robot_front_m`, `robot_half_width_m`,
    `safety_stop_dist_m`, `safety_slow_dist_m`).
 
+   **Controllers and safety** (launch arguments):
+
+   - `controller:=field` (default): steer along the learned field's gradient every
+     control tick toward a point ~0.6 m ahead on the SLAM-map route; no
+     plan-validate-follow pauses. Where the field disagrees with the route by
+     more than 60 degrees (e.g. a passage it has not learned), the route wins.
+   - `controller:=nav2`: Nav2 MPPI (`config/nav2_jackal_controller.yaml`) follows
+     the NTFields field path (or the map route as fallback).
+   - `controller:=path`: the original plan/validate/follow pieces.
+   - `safety_mode:=scan` (default): every command is checked by predicting the
+     true footprint along its arc against live lidar points (+5 s memory) and the
+     SLAM map; it brakes before contact, creeps with a 1 cm margin in tight spots,
+     and slows down by side clearance. `safety_mode:=grid` restores the original
+     SLAM-grid guards.
+
+   Logs of every run are kept in `~/mntfields_logs` (node log:
+   `python3_<pid>_<time>.log`); `[CTRL]` lines say which check changed a command.
+
    RViz opens with `rviz/antfields_jackal.rviz`: SLAM map, scan, Jackal model,
    field path, frontier/goal markers and the learned travel-time field from the
    robot's current position (`/mntfields/travel_time`, a PointCloud2 whose

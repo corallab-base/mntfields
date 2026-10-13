@@ -1,0 +1,132 @@
+# Nav2 controller_server for controller:=nav2 (antfields_jackal_mapping.launch.py).
+# MPPI follows the NTFields path (sent by antfields_gridmap_node as FollowPath goals)
+# with a fine local costmap from the live scan and the SLAM map. The Jackal's lidar
+# faces the rear, so forward speed is capped low and reversing is the preferred way
+# to drive (the sensor leads). Topics, frames and speeds are set by the launch file.
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    costmap_update_timeout: 0.30
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.5
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+    use_realtime_priority: false
+    enable_stamped_cmd_vel: true
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance: 15.0
+    general_goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 6.28
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 20
+      model_dt: 0.1
+      batch_size: 2000
+      vx_std: 0.15
+      vy_std: 0.0
+      wz_std: 0.5
+      vx_max: 0.01      # rear-facing lidar: (almost) only reverse, so the sensor leads
+      vx_min: -0.20
+      vy_max: 0.0
+      wz_max: 0.8
+      ax_max: 1.0
+      ax_min: -1.0
+      ay_max: 0.0
+      az_max: 2.5
+      iteration_count: 1
+      prune_distance: 1.5
+      transform_tolerance: 0.2
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: false
+      regenerate_noises: true
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "PathAlignCritic",
+                "PathFollowCritic", "PathAngleCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.0
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 2
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.0
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 1   # no direction preference: reversing toward the path is fine
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.025
+      # True Jackal footprint (0.51 x 0.43 m); narrow passages leave only a few cm.
+      footprint: "[[0.255, 0.215], [0.255, -0.215], [-0.255, -0.215], [-0.255, 0.215]]"
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+        map_topic: /map
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 4.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 3.5
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 15.0   # steep: little cost beyond a few cm from walls
+        inflation_radius: 0.40      # >= circumscribed radius (0.33 m) for footprint checks
+      always_send_full_costmap: true

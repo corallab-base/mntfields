@@ -85,6 +85,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-jazzy-clearpath-sensors-description \
     && rm -rf /var/lib/apt/lists/*
 
+# Nav2 local controller (controller:=nav2): MPPI / Regulated Pure Pursuit following
+# the NTFields path with a live-scan local costmap.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-jazzy-nav2-controller \
+        ros-jazzy-nav2-mppi-controller \
+        ros-jazzy-nav2-regulated-pure-pursuit-controller \
+        ros-jazzy-nav2-lifecycle-manager \
+        ros-jazzy-nav2-costmap-2d \
+        ros-jazzy-nav2-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

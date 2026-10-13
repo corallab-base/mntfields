@@ -9,6 +9,7 @@ namespace:
   /<ns>/sensors/lidar2d_0/scan       sensor_msgs/LaserScan, 40 Hz
   /<ns>/tf        odom -> base_link  (ground-truth odometry, 50 Hz)
   /<ns>/tf_static base_link -> lidar2d_0_laser (rear mount, facing backwards)
+  /<ns>/platform/odom/filtered       nav_msgs/Odometry (for Nav2)
   /<ns>/sim/ground_truth             geometry_msgs/PoseStamped (debugging)
 
 World: square room with border walls and a box in the centre, or (--map) the
@@ -26,6 +27,7 @@ import math
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped, TwistStamped
+from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -159,6 +161,8 @@ class SimJackal(Node):
         self.scan_pub = self.create_publisher(LaserScan, f"{ns}/sensors/lidar2d_0/scan",
                                               qos_profile_sensor_data)
         self.gt_pub = self.create_publisher(PoseStamped, f"{ns}/sim/ground_truth", 10)
+        self.odom_pub = self.create_publisher(Odometry, f"{ns}/platform/odom/filtered", 10)
+        self.v_now = self.w_now = 0.0
         self.create_subscription(TwistStamped, f"{ns}/cmd_vel", self.cmd_cb, 10)
 
         self.publish_static_tf()
@@ -182,6 +186,7 @@ class SimJackal(Node):
         nx = self.x + v * math.cos(self.yaw) * self.dt
         ny = self.y + v * math.sin(self.yaw) * self.dt
         if self.world.blocked(footprint_points(nx, ny, nyaw)):
+            self.v_now = self.w_now = 0.0
             if v != 0.0 or w != 0.0:
                 self.collisions += 1
                 if self.collisions == 1 or self.collisions % 25 == 0:
@@ -191,6 +196,7 @@ class SimJackal(Node):
         else:
             self.dist += abs(v) * self.dt
             self.x, self.y, self.yaw = nx, ny, math.atan2(math.sin(nyaw), math.cos(nyaw))
+            self.v_now, self.w_now = v, w
         stamp = self.get_clock().now().to_msg()
         t = TransformStamped()
         t.header.stamp = stamp
@@ -205,6 +211,11 @@ class SimJackal(Node):
         gt.pose.position.x, gt.pose.position.y = self.x, self.y
         gt.pose.orientation.z, gt.pose.orientation.w = q[2], q[3]
         self.gt_pub.publish(gt)
+        od = Odometry()
+        od.header.stamp, od.header.frame_id, od.child_frame_id = stamp, "odom", "base_link"
+        od.pose.pose = gt.pose
+        od.twist.twist.linear.x, od.twist.twist.angular.z = self.v_now, self.w_now
+        self.odom_pub.publish(od)
 
     def publish_static_tf(self):
         t = TransformStamped()

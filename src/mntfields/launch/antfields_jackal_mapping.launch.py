@@ -43,6 +43,8 @@ ANTFIELDS_PARAMS = [
     "path_end_tolerance_m",
     "goal_blacklist_radius_m",
     "abandoned_goal_ttl_sec",
+    "reached_goal_ttl_sec",
+    "look_at_reached_goal_sec",
     "max_lin",
     "max_ang",
     "fixed_region_size_m",
@@ -63,6 +65,8 @@ ANTFIELDS_PARAMS = [
     "validation_horizon_m",
     "route_subgoal_dist_m",
     "min_frontier_unknown_cells",
+    "replan_ahead_m",
+    "path_commit_max_m",
     "require_goalward_start",
     "safety_stop_enabled",
     "robot_front_m",
@@ -72,6 +76,19 @@ ANTFIELDS_PARAMS = [
     "safety_stop_dist_m",
     "safety_slow_dist_m",
     "robot_turn_radius_m",
+    "footprint_half_length_m",
+    "footprint_half_width_m",
+    "grid_footprint_margin_m",
+    "controller",
+    "safety_mode",
+    "scan_safety_margin_m",
+    "scan_safety_min_margin_m",
+    "narrow_speed_gap_m",
+    "route_preferred_clearance_m",
+    "near_obstacle_speed",
+    "field_alpha",
+    "field_goal_stuck_sec",
+    "return_to_start",
     "initial_spin",
 ]
 
@@ -150,7 +167,42 @@ def _launch_setup(context, *args, **kwargs):
         condition=IfCondition(LaunchConfiguration("rviz")),
     )
 
-    return [slam_toolbox, antfields_node, rviz]
+    actions = [slam_toolbox, antfields_node, rviz]
+    if arg("controller") == "nav2":
+        # Nav2 MPPI follows the field path; its cmd_vel goes back to antfields_gridmap,
+        # which passes it through the safety filter to the robot.
+        nav2_params = os.path.join(
+            get_package_share_directory("mntfields"), "config", "nav2_jackal_controller.yaml")
+        actions += [
+            Node(
+                package="nav2_controller",
+                executable="controller_server",
+                name="controller_server",
+                output="screen",
+                parameters=[nav2_params, {
+                    "use_sim_time": use_sim_time,
+                    "odom_topic": f"{prefix}/platform/odom/filtered",
+                    "FollowPath.vx_min": -float(arg("max_lin")),
+                    "FollowPath.wz_max": float(arg("max_ang")),
+                }],
+                remappings=tf_remaps + [
+                    ("/scan", scan_topic),
+                    ("cmd_vel", "/antfields/nav2_cmd_vel"),
+                ],
+            ),
+            Node(
+                package="nav2_lifecycle_manager",
+                executable="lifecycle_manager",
+                name="lifecycle_manager_controller",
+                output="screen",
+                parameters=[{
+                    "use_sim_time": use_sim_time,
+                    "autostart": True,
+                    "node_names": ["controller_server"],
+                }],
+            ),
+        ]
+    return actions
 
 
 def generate_launch_description():
@@ -183,13 +235,14 @@ def generate_launch_description():
             DeclareLaunchArgument("wall_min_m", default_value="0.05"),
             DeclareLaunchArgument("wall_max_m", default_value="0.80"),
             DeclareLaunchArgument(
-                "wall_offset_m", default_value="0.25",
-                description="Field clearance for the Jackal (half-width 0.215 m + margin)"),
+                "wall_offset_m", default_value="0.17",
+                description="Field clearance: field is slowest up to wall_offset_m + wall_min_m from walls; "
+                "keep that equal to collision_radius_m so the field uses every gap the route does"),
             DeclareLaunchArgument(
                 "collision_pad_cells", default_value="7",
                 description="Square padding; only used when collision_radius_m is negative"),
             DeclareLaunchArgument(
-                "collision_radius_m", default_value="0.30",
+                "collision_radius_m", default_value="0.22",
                 description="Reject paths closer than this to a wall (Jackal half-width 0.215 + margin); "
                 "0 = no inflation, negative = square collision_pad_cells"),
             DeclareLaunchArgument("goal_reached_dist", default_value="0.40"),
@@ -198,10 +251,16 @@ def generate_launch_description():
                 description="Follower: how close to the end of each committed path piece is done"),
             DeclareLaunchArgument("goal_blacklist_radius_m", default_value="0.8"),
             DeclareLaunchArgument(
+                "reached_goal_ttl_sec", default_value="120.0",
+                description="How long a reached goal stays blacklisted (0 = whole run)"),
+            DeclareLaunchArgument(
+                "look_at_reached_goal_sec", default_value="8.0",
+                description="Turn the (rear-facing) lidar toward each reached goal, for at most this long"),
+            DeclareLaunchArgument(
                 "abandoned_goal_ttl_sec", default_value="60.0",
                 description="How long an abandoned (unreached) frontier stays blacklisted"),
             DeclareLaunchArgument("max_lin", default_value="0.20"),
-            DeclareLaunchArgument("max_ang", default_value="0.6"),
+            DeclareLaunchArgument("max_ang", default_value="0.8"),
             DeclareLaunchArgument("fixed_region_size_m", default_value="20.0"),
             DeclareLaunchArgument("expand_region_with_map", default_value="false"),
             DeclareLaunchArgument("train_timer_sec", default_value="0.4"),
@@ -237,6 +296,12 @@ def generate_launch_description():
                 "route_subgoal_dist_m", default_value="1.5",
                 description="Far frontiers: field plans to this far along the SLAM-map route (0 = off)"),
             DeclareLaunchArgument(
+                "replan_ahead_m", default_value="0.35",
+                description="Plan the next path piece this close to the end of the current one, while driving"),
+            DeclareLaunchArgument(
+                "path_commit_max_m", default_value="0.8",
+                description="Length of each committed path piece (re-validated on every replan)"),
+            DeclareLaunchArgument(
                 "min_frontier_unknown_cells", default_value="20",
                 description="Ignore frontiers at unknown holes smaller than this (cells) in mapped space"),
             DeclareLaunchArgument(
@@ -251,14 +316,50 @@ def generate_launch_description():
                 description="Drive rear-first: this Jackal's lidar faces the rear (power-button side)"),
             DeclareLaunchArgument("robot_half_width_m", default_value="0.25"),
             DeclareLaunchArgument(
-                "safety_stop_dist_m", default_value="0.25",
+                "safety_stop_dist_m", default_value="0.12",
                 description="Stop forward motion when an obstacle is this close ahead of the bumper"),
             DeclareLaunchArgument(
-                "safety_slow_dist_m", default_value="0.60",
+                "safety_slow_dist_m", default_value="0.40",
                 description="Start slowing down at this gap ahead of the bumper"),
             DeclareLaunchArgument(
                 "robot_turn_radius_m", default_value="0.34",
                 description="Clearance needed to turn on the spot (Jackal corners sweep 0.333 m)"),
+            # True Jackal footprint (0.51 x 0.43 m). The SLAM-grid guards (safety_mode:=grid)
+            # add grid_footprint_margin_m, since mapped wall cells are only grid-accurate.
+            DeclareLaunchArgument("footprint_half_length_m", default_value="0.255"),
+            DeclareLaunchArgument("footprint_half_width_m", default_value="0.215"),
+            DeclareLaunchArgument("grid_footprint_margin_m", default_value="0.025"),
+            DeclareLaunchArgument(
+                "controller", default_value="field",
+                description="field: steer along the field gradient every tick; nav2: Nav2 MPPI "
+                "follows the field path; path: plan/validate/follow pieces (original)"),
+            DeclareLaunchArgument(
+                "safety_mode", default_value="scan",
+                description="scan: predictive footprint check on live lidar points; grid: SLAM-grid guards"),
+            DeclareLaunchArgument(
+                "scan_safety_margin_m", default_value="0.03",
+                description="Margin around the true footprint for the live-scan safety check"),
+            DeclareLaunchArgument(
+                "narrow_speed_gap_m", default_value="0.06",
+                description="Side gap (m) to obstacles below which near_obstacle_speed applies"),
+            DeclareLaunchArgument(
+                "near_obstacle_speed", default_value="0.10",
+                description="Speed cap (m/s) near obstacles; >= max_lin disables the slowdown"),
+            DeclareLaunchArgument(
+                "route_preferred_clearance_m", default_value="0.45",
+                description="Routes keep this far from walls where there is room"),
+            DeclareLaunchArgument(
+                "scan_safety_min_margin_m", default_value="0.01",
+                description="Margin still allowed at creeping speed in tight passages"),
+            DeclareLaunchArgument(
+                "field_alpha", default_value="0.8",
+                description="Field gradient weight per step (rest: straight toward the target)"),
+            DeclareLaunchArgument(
+                "return_to_start", default_value="true",
+                description="controller:=field/nav2: drive back to the start point when exploration is complete"),
+            DeclareLaunchArgument(
+                "field_goal_stuck_sec", default_value="10.0",
+                description="controller:=field: abandon a frontier after this long without progress"),
             DeclareLaunchArgument("initial_spin", default_value="true"),
             OpaqueFunction(function=_launch_setup),
         ]
